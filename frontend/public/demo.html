@@ -1,0 +1,116 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>PDF Chatbot Widget Demo</title>
+  <link rel="stylesheet" href="widget.css" />
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; max-width: 640px; margin: 60px auto; color: #1f2937; }
+
+    #inline-chat { margin-top: 32px; border: 1px solid #e5e7eb; border-radius: 12px; overflow: hidden; }
+    #inline-chat .pdfchat-messages { height: 320px; }
+    #inline-chat .pdfchat-inputrow input { font-size: 14px; padding: 10px; }
+  </style>
+</head>
+<body>
+  <h1>Your PDF Chatbot</h1>
+  <p>
+    This page stands in for your real site. The chat bubble in the bottom-right
+    corner is the widget from <code>widget.js</code> -- it talks to the FastAPI
+    backend at the URL set in <code>data-api-url</code> below.
+  </p>
+  <p>
+    Make sure the backend is running (<code>uvicorn main:app --port 8000</code>)
+    and you've run <code>python ingest.py</code> at least once before asking
+    questions here.
+  </p>
+
+  <h2>Ask a question inline</h2>
+  <p>
+    This box talks to the same <code>POST /chat</code> endpoint as the widget,
+    just rendered directly on the page instead of in a floating panel.
+  </p>
+  <div id="inline-chat">
+    <div class="pdfchat-header">Ask about our documents</div>
+    <div class="pdfchat-messages" id="inline-messages"></div>
+    <div class="pdfchat-inputrow">
+      <input type="text" id="inline-input" placeholder="Ask a question..." />
+      <button id="inline-send">Send</button>
+    </div>
+  </div>
+
+  <!-- Change data-api-url to wherever your FastAPI backend is deployed. -->
+  <script src="widget.js" data-api-url="http://localhost:8000"></script>
+
+  <script>
+    (function () {
+      var API_URL = "http://localhost:8000";
+      var messages = document.getElementById("inline-messages");
+      var input = document.getElementById("inline-input");
+      var sendBtn = document.getElementById("inline-send");
+
+      function el(tag, className, text) {
+        var e = document.createElement(tag);
+        if (className) e.className = className;
+        if (text !== undefined) e.textContent = text;
+        return e;
+      }
+
+      function addMessage(role, text) {
+        var msg = el("div", "pdfchat-msg " + role, text);
+        messages.appendChild(msg);
+        messages.scrollTop = messages.scrollHeight;
+        return msg;
+      }
+
+      function addSources(container, sources) {
+        if (!sources || !sources.length) return;
+        var seen = {};
+        var parts = [];
+        sources.forEach(function (s) {
+          var key = s.source + "#" + s.page;
+          if (seen[key]) return;
+          seen[key] = true;
+          parts.push((s.source || "unknown") + (s.page ? ", p." + s.page : ""));
+        });
+        var srcEl = el("div", "pdfchat-sources", "Sources: " + parts.join("; "));
+        container.appendChild(srcEl);
+      }
+
+      function ask() {
+        var question = input.value.trim();
+        if (!question) return;
+        input.value = "";
+        sendBtn.disabled = true;
+        addMessage("user", question);
+        var thinking = addMessage("bot", "Thinking...");
+
+        fetch(API_URL + "/chat", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ question: question }),
+        })
+          .then(function (res) {
+            if (!res.ok) throw new Error("Request failed: " + res.status);
+            return res.json();
+          })
+          .then(function (data) {
+            thinking.textContent = data.answer;
+            addSources(thinking, data.sources);
+          })
+          .catch(function (err) {
+            thinking.textContent = "Sorry, something went wrong talking to the backend (" + err.message + ").";
+          })
+          .finally(function () {
+            sendBtn.disabled = false;
+          });
+      }
+
+      sendBtn.addEventListener("click", ask);
+      input.addEventListener("keydown", function (e) {
+        if (e.key === "Enter") ask();
+      });
+    })();
+  </script>
+</body>
+</html>

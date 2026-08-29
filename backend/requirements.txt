@@ -1,0 +1,8 @@
+# Tested with the versions below (Python 3.11). Newer patch/minor versions
+# will very likely work too; pin exactly if you want full reproducibility.
+chromadb>=1.5.9
+fastapi>=0.141.1
+uvicorn[standard]>=0.52.4
+ollama>=0.6.2
+pypdf>=6.16.2
+python-multipart>=0.0.32

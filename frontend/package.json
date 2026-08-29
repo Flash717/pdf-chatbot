@@ -1,0 +1,12 @@
+{
+  "name": "pdf-chatbot-widget",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Static file server for the embeddable PDF chatbot widget (local dev/demo only).",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2"
+  }
+}
