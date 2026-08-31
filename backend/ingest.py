@@ -1,7 +1,8 @@
 """
-Extract text from every PDF in PDF_DIR, split it into overlapping chunks,
-embed each chunk with a local Ollama embedding model, and store the
-result in a persistent Chroma collection on disk.
+Extract text from every PDF in PDF_DIR, split it into paragraph/sentence-
+aware chunks, embed each chunk (with a bit of prepended context) using a
+local Ollama embedding model, store the result in a persistent Chroma
+collection, and rebuild the BM25 keyword index used for hybrid search.
 
 Usage:
     python ingest.py
@@ -22,6 +23,8 @@ import ollama
 from pypdf import PdfReader
 
 import config
+from chunking import chunk_text
+from hybrid_search import build_bm25_index
 
 
 def get_chroma_collection():
@@ -42,23 +45,6 @@ def extract_pages(pdf_path: Path):
             yield i, text
 
 
-def chunk_text(text: str, size: int, overlap: int):
-    """Split text into overlapping character-based chunks."""
-    if size <= overlap:
-        raise ValueError("CHUNK_SIZE must be greater than CHUNK_OVERLAP")
-    chunks = []
-    start, n = 0, len(text)
-    while start < n:
-        end = min(start + size, n)
-        chunk = text[start:end].strip()
-        if chunk:
-            chunks.append(chunk)
-        if end == n:
-            break
-        start = end - overlap
-    return chunks
-
-
 def batched(items, batch_size):
     for i in range(0, len(items), batch_size):
         yield items[i : i + batch_size]
@@ -69,15 +55,58 @@ def embed_batch(client: ollama.Client, texts):
     return response.embeddings
 
 
-def ingest_pdf(pdf_path: Path, collection, ollama_client: ollama.Client = None):
-    """Extract, chunk, embed, and store one PDF. Returns chunk count."""
-    ollama_client = ollama_client or ollama.Client(host=config.OLLAMA_HOST)
-    doc_id = pdf_path.stem
+def generate_chunk_context(client: ollama.Client, doc_title: str, page_num: int, page_text: str, chunk: str) -> str:
+    """Ask the chat model for a short sentence situating this chunk within
+    its page, to prepend to the embedding input. Only called when
+    CONTEXTUALIZE_CHUNKS=true -- see config.py for the cost tradeoff.
+    """
+    prompt = (
+        f"Document: {doc_title}\n"
+        f"Full text of page {page_num}:\n{page_text}\n\n"
+        f"Excerpt from that page:\n{chunk}\n\n"
+        "In one short sentence (max 25 words), describe what this excerpt "
+        "covers and how it relates to the page, so someone could tell what "
+        "it's about without seeing the rest of the page. Reply with only "
+        "that sentence, nothing else."
+    )
+    try:
+        response = client.chat(model=config.CHAT_MODEL, messages=[{"role": "user", "content": prompt}])
+        return response.message.content.strip()
+    except Exception as e:
+        print(f"    [!] chunk-context generation failed, continuing without it: {e}")
+        return ""
 
-    records = []  # list of (chunk_text, page_number)
+
+def build_embed_text(doc_title: str, page_num: int, chunk: str, llm_context: str = "") -> str:
+    """The text actually sent to the embedding model: clean chunk text
+    prefixed with cheap deterministic context (always) and, optionally,
+    an LLM-generated context sentence. The chunk stored in Chroma's
+    `documents` field stays as the clean, unprefixed text -- this prefix
+    only affects what gets embedded, to help the embedding capture which
+    document/section a chunk belongs to without polluting what the
+    answering model actually reads.
+    """
+    header = f"Document: {doc_title} | Page {page_num}"
+    if llm_context:
+        header += f"\nContext: {llm_context}"
+    return f"{header}\n\n{chunk}"
+
+
+def ingest_pdf(pdf_path: Path, collection, ollama_client: ollama.Client = None):
+    """Extract, chunk, (optionally contextualize,) embed, and store one
+    PDF. Returns chunk count."""
+    ollama_client = ollama_client or ollama.Client(host=config.OLLAMA_HOST)
+    doc_title = pdf_path.stem
+
+    # records: list of (chunk_text, page_number, embed_text)
+    records = []
     for page_num, page_text in extract_pages(pdf_path):
-        for chunk in chunk_text(page_text, config.CHUNK_SIZE, config.CHUNK_OVERLAP):
-            records.append((chunk, page_num))
+        for chunk in chunk_text(page_text, config.CHUNK_SIZE, config.OVERLAP_SENTENCES):
+            llm_context = ""
+            if config.CONTEXTUALIZE_CHUNKS:
+                llm_context = generate_chunk_context(ollama_client, doc_title, page_num, page_text, chunk)
+            embed_text = build_embed_text(doc_title, page_num, chunk, llm_context)
+            records.append((chunk, page_num, embed_text))
 
     if not records:
         print(f"  [!] No extractable text in {pdf_path.name} -- "
@@ -85,25 +114,26 @@ def ingest_pdf(pdf_path: Path, collection, ollama_client: ollama.Client = None):
         return 0
 
     all_embeddings = []
-    texts_only = [r[0] for r in records]
-    for i, batch in enumerate(batched(texts_only, config.EMBED_BATCH_SIZE)):
+    embed_texts = [r[2] for r in records]
+    for i, batch in enumerate(batched(embed_texts, config.EMBED_BATCH_SIZE)):
         all_embeddings.extend(embed_batch(ollama_client, batch))
-        done = min((i + 1) * config.EMBED_BATCH_SIZE, len(texts_only))
-        print(f"    embedded {done}/{len(texts_only)} chunks", end="\r")
+        done = min((i + 1) * config.EMBED_BATCH_SIZE, len(embed_texts))
+        print(f"    embedded {done}/{len(embed_texts)} chunks", end="\r")
     print()
 
-    ids, metadatas = [], []
-    for idx, (chunk, page_num) in enumerate(records):
+    ids, documents, metadatas = [], [], []
+    for idx, (chunk, page_num, _embed_text) in enumerate(records):
         chunk_id = hashlib.sha256(
-            f"{doc_id}-p{page_num}-{idx}-{chunk[:80]}".encode("utf-8")
+            f"{doc_title}-p{page_num}-{idx}-{chunk[:80]}".encode("utf-8")
         ).hexdigest()
         ids.append(chunk_id)
+        documents.append(chunk)
         metadatas.append({"source": pdf_path.name, "page": page_num})
 
     collection.upsert(
         ids=ids,
         embeddings=all_embeddings,
-        documents=texts_only,
+        documents=documents,
         metadatas=metadatas,
     )
     return len(records)
@@ -116,6 +146,11 @@ def main():
         print(f"No PDFs found in {config.PDF_DIR}")
         print("Drop .pdf files there and re-run: python ingest.py")
         return
+
+    if config.CONTEXTUALIZE_CHUNKS:
+        print("CONTEXTUALIZE_CHUNKS is on: this will make one extra chat-model "
+              "call per chunk during ingestion, which is much slower for "
+              "hundreds of pages. Turn it off in .env if this is too slow.\n")
 
     try:
         collection = get_chroma_collection()
@@ -136,6 +171,9 @@ def main():
             continue
         print(f"  -> {n} chunks stored")
         total += n
+
+    print("\nRebuilding BM25 keyword index for hybrid search...")
+    build_bm25_index(collection)
 
     print(f"\nDone. {total} chunks in collection '{config.COLLECTION_NAME}' "
           f"at {config.CHROMA_DIR}")

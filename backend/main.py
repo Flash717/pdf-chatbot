@@ -19,6 +19,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 import config
+from hybrid_search import build_bm25_index
 from ingest import get_chroma_collection, ingest_pdf
 from rag import answer_question
 
@@ -83,5 +84,9 @@ async def ingest(files: List[UploadFile] = File(...)):
             results.append({"file": f.filename, "chunks_added": n_chunks})
         except Exception as e:
             results.append({"file": f.filename, "status": f"failed: {e}"})
+
+    # Keep the BM25 keyword index (used for hybrid search) in sync with
+    # whatever's now in Chroma.
+    build_bm25_index(collection)
 
     return {"results": results}
